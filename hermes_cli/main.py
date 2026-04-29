@@ -6249,8 +6249,11 @@ def _cmd_update_check():
                 print(f"  {stderr.splitlines()[0]}")
         sys.exit(1)
 
+    current_branch = _get_current_git_branch(git_cmd, PROJECT_ROOT)
+    branch, _ = _select_update_branch(git_cmd, PROJECT_ROOT, current_branch)
+
     rev_result = subprocess.run(
-        git_cmd + ["rev-list", "HEAD..origin/main", "--count"],
+        git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
@@ -6262,9 +6265,48 @@ def _cmd_update_check():
         print("✓ Already up to date.")
     else:
         commits_word = "commit" if behind == 1 else "commits"
-        print(f"⚕ Update available: {behind} {commits_word} behind origin/main.")
+        print(f"⚕ Update available: {behind} {commits_word} behind origin/{branch}.")
         from hermes_cli.config import recommended_update_command
         print(f"  Run '{recommended_update_command()}' to install.")
+
+
+def _get_current_git_branch(git_cmd: list[str], cwd: Path) -> str:
+    """Return the current git branch, or ``HEAD`` when detached."""
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _remote_branch_exists(git_cmd: list[str], cwd: Path, branch: str) -> bool:
+    """Return True when ``origin/<branch>`` exists."""
+    if not branch or branch == "HEAD":
+        return False
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def _select_update_branch(
+    git_cmd: list[str], cwd: Path, current_branch: str
+) -> tuple[str, bool]:
+    """Choose which origin branch ``hermes update`` should track.
+
+    Custom fork users often run Hermes from a long-lived branch.  Prefer the
+    current branch when the fork has the same branch on ``origin``; fall back to
+    ``main`` for detached HEAD or local-only branches.
+    """
+    if _remote_branch_exists(git_cmd, cwd, current_branch):
+        return current_branch, False
+    return "main", current_branch != "main"
 
 
 def _ensure_fhs_path_guard() -> None:
@@ -6563,31 +6605,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
 
-        # Get current branch (returns literal "HEAD" when detached)
-        result = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
+        current_branch = _get_current_git_branch(git_cmd, PROJECT_ROOT)
+        branch, should_checkout_branch = _select_update_branch(
+            git_cmd, PROJECT_ROOT, current_branch
         )
-        current_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
-
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
+        # If detached or on a local-only branch, switch to main. Otherwise,
+        # update the current origin-backed branch in place.
+        if should_checkout_branch:
             label = (
                 "detached HEAD"
                 if current_branch == "HEAD"
                 else f"branch '{current_branch}'"
             )
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
+            print(
+                f"  ⚠ Currently on {label} without origin/{current_branch} — "
+                f"switching to {branch} for update..."
+            )
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
             subprocess.run(
-                git_cmd + ["checkout", "main"],
+                git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -6621,7 +6659,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
-            if current_branch not in ("main", "HEAD"):
+            if should_checkout_branch and current_branch not in ("main", "HEAD"):
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=PROJECT_ROOT,
