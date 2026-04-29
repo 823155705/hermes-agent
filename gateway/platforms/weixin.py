@@ -100,6 +100,27 @@ MEDIA_VOICE = 4
 _LIVE_ADAPTERS: Dict[str, Any] = {}
 
 
+def _session_uses_current_loop(session: Any) -> bool:
+    """Return True when an aiohttp session is bound to the running event loop."""
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    session_loop = getattr(session, "_loop", None)
+    return session_loop is None or session_loop is current_loop
+
+
+def _ilink_response_error(response: Optional[Dict[str, Any]]) -> Optional[Tuple[Any, Any, str]]:
+    if not isinstance(response, dict):
+        return None
+    ret = response.get("ret")
+    errcode = response.get("errcode")
+    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+        errmsg = response.get("errmsg") or response.get("msg") or "unknown error"
+        return ret, errcode, str(errmsg)
+    return None
+
+
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     """Return a TCPConnector with a certifi CA bundle, or None if certifi is unavailable.
 
@@ -1498,66 +1519,81 @@ class WeixinAdapter(BasePlatformAdapter):
         degraded fallback, which keeps cron-initiated push messages working
         even when no user message has refreshed the session recently.
         """
+        async def _send_once(active_context_token: Optional[str]) -> Dict[str, Any]:
+            return await _send_message(
+                self._send_session,
+                base_url=self._base_url,
+                token=self._token,
+                to=chat_id,
+                text=chunk,
+                context_token=active_context_token,
+                client_id=client_id,
+            )
+
+        await self._send_ilink_message_with_retry(
+            chat_id=chat_id,
+            context_token=context_token,
+            client_id=client_id,
+            send_once=_send_once,
+        )
+
+    async def _send_ilink_message_with_retry(
+        self,
+        *,
+        chat_id: str,
+        context_token: Optional[str],
+        client_id: str,
+        send_once,
+    ) -> None:
+        """Send one iLink sendmessage payload with response-code retry handling."""
         last_error: Optional[Exception] = None
         retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
             try:
-                resp = await _send_message(
-                    self._send_session,
-                    base_url=self._base_url,
-                    token=self._token,
-                    to=chat_id,
-                    text=chunk,
-                    context_token=context_token,
-                    client_id=client_id,
-                )
-                # Check iLink response for session-expired error
-                if resp and isinstance(resp, dict):
-                    ret = resp.get("ret")
-                    errcode = resp.get("errcode")
-                    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
-                        is_session_expired = (
-                            ret == SESSION_EXPIRED_ERRCODE
-                            or errcode == SESSION_EXPIRED_ERRCODE
+                resp = await send_once(context_token)
+                error = _ilink_response_error(resp)
+                if error is not None:
+                    ret, errcode, errmsg = error
+                    is_session_expired = (
+                        ret == SESSION_EXPIRED_ERRCODE
+                        or errcode == SESSION_EXPIRED_ERRCODE
+                    )
+                    # Session expired — strip token and retry once
+                    if is_session_expired and not retried_without_token and context_token:
+                        retried_without_token = True
+                        context_token = None
+                        self._token_store._cache.pop(
+                            self._token_store._key(self._account_id, chat_id), None
                         )
-                        # Session expired — strip token and retry once
-                        if is_session_expired and not retried_without_token and context_token:
-                            retried_without_token = True
-                            context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
-                            )
-                            logger.warning(
-                                "[%s] session expired for %s; retrying without context_token",
-                                self.name, _safe_id(chat_id),
-                            )
-                            continue
-                        # Rate limit (-2) — backoff and retry
-                        is_rate_limited = (
-                            ret == RATE_LIMIT_ERRCODE
-                            or errcode == RATE_LIMIT_ERRCODE
+                        logger.warning(
+                            "[%s] session expired for %s; retrying without context_token",
+                            self.name, _safe_id(chat_id),
                         )
-                        if is_rate_limited:
-                            errmsg = resp.get("errmsg") or resp.get("msg") or "rate limited"
-                            # Record the error so we raise a descriptive
-                            # RuntimeError (instead of AssertionError) if the
-                            # loop exhausts with the server still rate-limiting.
-                            last_error = RuntimeError(
-                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
-                            )
-                            if attempt >= self._send_chunk_retries:
-                                break
-                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                            logger.warning(
-                                "[%s] rate limited for %s; backing off %.1fs before retry",
-                                self.name, _safe_id(chat_id), wait,
-                            )
-                            await asyncio.sleep(wait)
-                            continue
-                        errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-                        raise RuntimeError(
-                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
+                        continue
+                    # Rate limit (-2) — backoff and retry
+                    is_rate_limited = (
+                        ret == RATE_LIMIT_ERRCODE
+                        or errcode == RATE_LIMIT_ERRCODE
+                    )
+                    if is_rate_limited:
+                        # Record the error so we raise a descriptive
+                        # RuntimeError (instead of AssertionError) if the
+                        # loop exhausts with the server still rate-limiting.
+                        last_error = RuntimeError(
+                            f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
+                        if attempt >= self._send_chunk_retries:
+                            break
+                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                        logger.warning(
+                            "[%s] rate limited for %s; backing off %.1fs before retry",
+                            self.name, _safe_id(chat_id), wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise RuntimeError(
+                        f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
+                    )
                 return
             except Exception as exc:
                 last_error = exc
@@ -1867,34 +1903,52 @@ class WeixinAdapter(BasePlatformAdapter):
         last_message_id = None
         if caption:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-            await _send_message(
-                self._send_session,
-                base_url=self._base_url,
-                token=self._token,
-                to=chat_id,
-                text=self.format_message(caption),
+            formatted_caption = self.format_message(caption)
+
+            async def _send_caption(active_context_token: Optional[str]) -> Dict[str, Any]:
+                return await _send_message(
+                    self._send_session,
+                    base_url=self._base_url,
+                    token=self._token,
+                    to=chat_id,
+                    text=formatted_caption,
+                    context_token=active_context_token,
+                    client_id=last_message_id,
+                )
+
+            await self._send_ilink_message_with_retry(
+                chat_id=chat_id,
                 context_token=context_token,
                 client_id=last_message_id,
+                send_once=_send_caption,
             )
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
-            self._send_session,
-            base_url=self._base_url,
-            endpoint=EP_SEND_MESSAGE,
-            payload={
-                "msg": {
-                    "from_user_id": "",
-                    "to_user_id": chat_id,
-                    "client_id": last_message_id,
-                    "message_type": MSG_TYPE_BOT,
-                    "message_state": MSG_STATE_FINISH,
-                    "item_list": [media_item],
-                    **({"context_token": context_token} if context_token else {}),
-                }
-            },
-            token=self._token,
-            timeout_ms=API_TIMEOUT_MS,
+        async def _send_media(active_context_token: Optional[str]) -> Dict[str, Any]:
+            message = {
+                "from_user_id": "",
+                "to_user_id": chat_id,
+                "client_id": last_message_id,
+                "message_type": MSG_TYPE_BOT,
+                "message_state": MSG_STATE_FINISH,
+                "item_list": [media_item],
+            }
+            if active_context_token:
+                message["context_token"] = active_context_token
+            return await _api_post(
+                self._send_session,
+                base_url=self._base_url,
+                endpoint=EP_SEND_MESSAGE,
+                payload={"msg": message},
+                token=self._token,
+                timeout_ms=API_TIMEOUT_MS,
+            )
+
+        await self._send_ilink_message_with_retry(
+            chat_id=chat_id,
+            context_token=context_token,
+            client_id=last_message_id,
+            send_once=_send_media,
         )
         return last_message_id
 
@@ -2005,7 +2059,12 @@ async def send_weixin_direct(
 
     live_adapter = _LIVE_ADAPTERS.get(resolved_token)
     send_session = getattr(live_adapter, '_send_session', None)
-    if live_adapter is not None and send_session is not None and not send_session.closed:
+    if (
+        live_adapter is not None
+        and send_session is not None
+        and not send_session.closed
+        and _session_uses_current_loop(send_session)
+    ):
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
         if cleaned:

@@ -467,6 +467,95 @@ class TestWeixinOutboundMedia:
         assert media["encrypt_query_param"] == "enc-param"
         assert media["aes_key"] == expected_aes_key
 
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch.object(weixin, "_api_post", new_callable=AsyncMock)
+    @patch.object(weixin, "_upload_ciphertext", new_callable=AsyncMock)
+    @patch.object(weixin, "_get_upload_url", new_callable=AsyncMock)
+    def test_send_file_retries_rate_limited_media_sendmessage(
+        self,
+        get_upload_url_mock,
+        upload_ciphertext_mock,
+        api_post_mock,
+        sleep_mock,
+        tmp_path,
+    ):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter._send_session = adapter._session
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._send_chunk_retries = 1
+
+        image_path = tmp_path / "demo.png"
+        image_path.write_bytes(b"fake-png-bytes")
+        get_upload_url_mock.return_value = {"upload_full_url": "https://upload.example.com/media"}
+        upload_ciphertext_mock.return_value = "enc-q"
+        api_post_mock.side_effect = [
+            {"ret": weixin.RATE_LIMIT_ERRCODE, "errmsg": "too frequent"},
+            {"ret": 0},
+        ]
+
+        message_id = asyncio.run(adapter._send_file("wxid_test123", str(image_path), ""))
+
+        assert message_id.startswith("hermes-weixin-")
+        assert api_post_mock.await_count == 2
+        sleep_mock.assert_awaited_once()
+
+    def test_session_uses_current_loop_rejects_foreign_loop(self):
+        foreign_loop = asyncio.new_event_loop()
+
+        class _Session:
+            _loop = foreign_loop
+
+        try:
+            async def _check():
+                assert weixin._session_uses_current_loop(_Session()) is False
+
+            asyncio.run(_check())
+        finally:
+            foreign_loop.close()
+
+    def test_send_weixin_direct_does_not_reuse_live_adapter_from_foreign_loop(self):
+        foreign_loop = asyncio.new_event_loop()
+
+        class _ForeignSession:
+            closed = False
+            _loop = foreign_loop
+
+        class _SessionContext:
+            def __init__(self, **_kwargs):
+                self.closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        live_adapter = _make_adapter()
+        live_adapter._send_session = _ForeignSession()
+        live_adapter.send = AsyncMock(side_effect=AssertionError("foreign live adapter should not be reused"))
+        weixin._LIVE_ADAPTERS["test-token"] = live_adapter
+
+        try:
+            with patch("gateway.platforms.weixin.aiohttp.ClientSession", side_effect=_SessionContext) as session_mock:
+                result = asyncio.run(
+                    weixin.send_weixin_direct(
+                        extra={"account_id": "test-account"},
+                        token="test-token",
+                        chat_id="wxid_test123",
+                        message="",
+                        media_files=[],
+                    )
+                )
+        finally:
+            weixin._LIVE_ADAPTERS.pop("test-token", None)
+            foreign_loop.close()
+
+        assert result["success"] is True
+        session_mock.assert_called_once()
+
 
 class TestWeixinRemoteMediaSafety:
     def test_download_remote_media_blocks_unsafe_urls(self):
