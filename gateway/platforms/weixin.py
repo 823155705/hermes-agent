@@ -1572,56 +1572,53 @@ class WeixinAdapter(BasePlatformAdapter):
         """Send one iLink sendmessage payload with response-code retry handling."""
         last_error: Optional[Exception] = None
         retried_without_token = False
+        active_context_token = context_token
         for attempt in range(self._send_chunk_retries + 1):
             try:
-                resp = await _send_message(
-                    self._send_session,
-                    base_url=self._base_url,
-                    token=self._token,
-                    to=chat_id,
-                    text=chunk,
-                    context_token=context_token,
-                    client_id=client_id,
-                )
+                resp = await send_once(active_context_token)
                 # Check iLink response for session-expired error
                 if resp and isinstance(resp, dict):
                     ret = resp.get("ret")
                     errcode = resp.get("errcode")
                     if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+                        errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
                             or errcode == SESSION_EXPIRED_ERRCODE
                             or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
-                        logger.warning(
-                            "[%s] session expired for %s; retrying without context_token",
-                            self.name, _safe_id(chat_id),
+                        if is_session_expired and active_context_token and not retried_without_token:
+                            logger.warning(
+                                "[%s] session expired for %s; retrying without context_token",
+                                self.name, _safe_id(chat_id),
+                            )
+                            active_context_token = None
+                            retried_without_token = True
+                            continue
+                        # Rate limit (-2) — backoff and retry
+                        is_rate_limited = (
+                            ret == RATE_LIMIT_ERRCODE
+                            or errcode == RATE_LIMIT_ERRCODE
                         )
-                        continue
-                    # Rate limit (-2) — backoff and retry
-                    is_rate_limited = (
-                        ret == RATE_LIMIT_ERRCODE
-                        or errcode == RATE_LIMIT_ERRCODE
-                    )
-                    if is_rate_limited:
-                        # Record the error so we raise a descriptive
-                        # RuntimeError (instead of AssertionError) if the
-                        # loop exhausts with the server still rate-limiting.
-                        last_error = RuntimeError(
-                            f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+                        if is_rate_limited:
+                            # Record the error so we raise a descriptive
+                            # RuntimeError (instead of AssertionError) if the
+                            # loop exhausts with the server still rate-limiting.
+                            last_error = RuntimeError(
+                                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+                            )
+                            if attempt >= self._send_chunk_retries:
+                                break
+                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            logger.warning(
+                                "[%s] rate limited for %s; backing off %.1fs before retry",
+                                self.name, _safe_id(chat_id), wait,
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        raise RuntimeError(
+                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
-                        if attempt >= self._send_chunk_retries:
-                            break
-                        wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
-                        logger.warning(
-                            "[%s] rate limited for %s; backing off %.1fs before retry",
-                            self.name, _safe_id(chat_id), wait,
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-                    raise RuntimeError(
-                        f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
-                    )
                 return
             except Exception as exc:
                 last_error = exc
