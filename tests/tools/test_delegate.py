@@ -32,6 +32,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_task_delegation_credentials,
 )
 
 
@@ -69,6 +70,11 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("model", props)
+        self.assertIn("provider", props)
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -1054,8 +1060,9 @@ class TestDelegationProviderIntegration(unittest.TestCase):
 
         # Patch _build_child_agent since credentials are now passed there
         # (agents are built in the main thread before being handed to workers)
-        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
-             patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
             mock_child = MagicMock()
             mock_build.return_value = mock_child
             mock_run.return_value = {
@@ -1094,8 +1101,9 @@ class TestDelegationProviderIntegration(unittest.TestCase):
         }
         parent = _make_mock_parent(depth=0)
 
-        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
-             patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, patch(
+            "tools.delegate_tool._run_single_child"
+        ) as mock_run:
             mock_child = MagicMock()
             mock_build.return_value = mock_child
             mock_run.return_value = {
@@ -1146,6 +1154,129 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             # But provider/base_url/api_key should inherit from parent
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["base_url"], parent.base_url)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_top_level_model_provider_override_config(self, mock_creds, mock_cfg):
+        """Top-level model/provider are forwarded above config-level defaults."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "config-model",
+            "provider": "config-provider",
+        }
+        mock_creds.return_value = {
+            "model": "top-model",
+            "provider": "top-provider",
+            "base_url": "https://top.example/v1",
+            "api_key": "top-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Top-level override test",
+                model="top-model",
+                provider="top-provider",
+                parent_agent=parent,
+            )
+
+            _, resolver_kwargs = mock_creds.call_args
+            self.assertEqual(resolver_kwargs["model_override"], "top-model")
+            self.assertEqual(resolver_kwargs["provider_override"], "top-provider")
+            _, agent_kwargs = MockAgent.call_args
+            self.assertEqual(agent_kwargs["model"], "top-model")
+            self.assertEqual(agent_kwargs["provider"], "top-provider")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_per_task_model_provider_override_top_level(self, mock_creds, mock_cfg):
+        """Parallel children can each resolve a different model/provider."""
+        mock_cfg.return_value = {"max_iterations": 45}
+
+        def _fake_creds(_cfg, _parent, *, model_override=None, provider_override=None):
+            return {
+                "model": model_override,
+                "provider": provider_override,
+                "base_url": f"https://{provider_override}.example/v1",
+                "api_key": f"{provider_override}-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = _fake_creds
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._build_child_agent") as mock_build, \
+             patch("tools.delegate_tool._run_single_child") as mock_run:
+            mock_build.return_value = MagicMock()
+            mock_run.return_value = {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "Done",
+                "api_calls": 1,
+                "duration_seconds": 1.0,
+            }
+
+            delegate_task(
+                tasks=[
+                    {
+                        "goal": "Collect",
+                        "model": "cheap-model",
+                        "provider": "siliconflow",
+                    },
+                    {"goal": "Review", "model": "v4-pro", "provider": "deepseek"},
+                    {"goal": "Polish", "model": "mimo-v2.5", "provider": "xiaomi"},
+                ],
+                model="top-model",
+                provider="top-provider",
+                parent_agent=parent,
+            )
+
+            self.assertEqual(mock_build.call_count, 3)
+            resolved = [
+                (call.kwargs["model"], call.kwargs["override_provider"])
+                for call in mock_build.call_args_list
+            ]
+            self.assertEqual(
+                resolved,
+                [
+                    ("cheap-model", "siliconflow"),
+                    ("v4-pro", "deepseek"),
+                    ("mimo-v2.5", "xiaomi"),
+                ],
+            )
+
+    def test_task_model_only_inherits_config_provider(self):
+        """A task-level model without provider still uses config provider."""
+        cfg = {
+            "model": "config-model",
+            "provider": "openrouter",
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider") as mock_runtime:
+            mock_runtime.return_value = {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "or-key",
+                "api_mode": "chat_completions",
+            }
+
+            creds = _resolve_task_delegation_credentials(
+                cfg,
+                parent,
+                task={"goal": "Review", "model": "task-model"},
+            )
+
+        self.assertEqual(creds["model"], "task-model")
+        self.assertEqual(creds["provider"], "openrouter")
+        self.assertEqual(creds["base_url"], "https://openrouter.ai/api/v1")
 
 
 class TestChildCredentialPoolResolution(unittest.TestCase):

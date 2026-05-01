@@ -1095,6 +1095,36 @@ def _build_child_agent(
     return child
 
 
+def _clean_optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _resolve_task_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    top_model: Optional[str] = None,
+    top_provider: Optional[str] = None,
+    task: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Resolve delegation credentials with task/top/config/parent priority."""
+    task = task or {}
+    task_model = _clean_optional_str(task.get("model"))
+    task_provider = _clean_optional_str(task.get("provider"))
+    effective_model = task_model or _clean_optional_str(top_model)
+    effective_provider = task_provider or _clean_optional_str(top_provider)
+
+    return _resolve_delegation_credentials(
+        cfg,
+        parent_agent,
+        model_override=effective_model,
+        provider_override=effective_provider,
+    )
+
+
 def _dump_subagent_timeout_diagnostic(
     *,
     child: Any,
@@ -1813,6 +1843,8 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
@@ -1824,8 +1856,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, role, model, provider)
+      - Batch:  provide tasks array [{goal, context, toolsets, role, model, provider}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -1881,16 +1913,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     if tasks and isinstance(tasks, list):
@@ -1905,7 +1927,14 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "model": model,
+                "provider": provider,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -1917,6 +1946,23 @@ def delegate_task(
     for i, task in enumerate(task_list):
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve each task's provider:model before constructing any child agents,
+    # so a bad per-task provider fails the whole call without half-spawned state.
+    resolved_task_creds = []
+    for t in task_list:
+        try:
+            resolved_task_creds.append(
+                _resolve_task_delegation_credentials(
+                    cfg,
+                    parent_agent,
+                    top_model=model,
+                    top_provider=provider,
+                    task=t,
+                )
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -1938,6 +1984,7 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            creds = resolved_task_creds[i]
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
@@ -2226,7 +2273,13 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -2241,9 +2294,23 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
-    configured_base_url = str(cfg.get("base_url") or "").strip() or None
+    configured_model = (
+        _clean_optional_str(model_override)
+        or str(cfg.get("model") or "").strip()
+        or None
+    )
+    configured_provider = (
+        _clean_optional_str(provider_override)
+        or str(cfg.get("provider") or "").strip()
+        or None
+    )
+    # An explicit task/top-level provider should win over config.base_url too.
+    provider_was_overridden = _clean_optional_str(provider_override) is not None
+    configured_base_url = (
+        None
+        if provider_was_overridden
+        else str(cfg.get("base_url") or "").strip() or None
+    )
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
 
     if configured_base_url:
@@ -2431,6 +2498,23 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional top-level model override for child agents. "
+                    "Per-task model overrides this; otherwise falls back to "
+                    "delegation.model config, then the parent model."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional top-level provider override for child agents "
+                    "(e.g. openrouter, nous, zai, kimi-coding, minimax). "
+                    "Per-task provider overrides this; otherwise falls back "
+                    "to delegation.provider/base_url config, then the parent provider."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2444,11 +2528,32 @@ DELEGATE_TASK_SCHEMA = {
                         "toolsets": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                            "description": (
+                                f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. "
+                                "Use 'web' for network access, 'terminal' for shell, "
+                                "'browser' for web interaction."
+                            ),
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model override. Overrides the top-level "
+                                "model and delegation.model for this task only."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Per-task provider override. Overrides the top-level "
+                                "provider and delegation.provider/base_url for this task only."
+                            ),
                         },
                         "acp_command": {
                             "type": "string",
-                            "description": "Per-task ACP command override (e.g. 'claude'). Overrides the top-level acp_command for this task only.",
+                            "description": (
+                                "Per-task ACP command override (e.g. 'claude'). "
+                                "Overrides the top-level acp_command for this task only."
+                            ),
                         },
                         "acp_args": {
                             "type": "array",
