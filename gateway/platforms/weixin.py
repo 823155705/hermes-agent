@@ -92,6 +92,18 @@ SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
+
+def _is_stale_session_ret(
+    ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
+) -> bool:
+    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
+    which is a stale-session signal (same as errcode=-14) rather than
+    a genuine rate limit."""
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    return (errmsg or "").lower() == "unknown error"
+
+
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
 MEDIA_FILE = 3
@@ -1231,6 +1243,17 @@ class WeixinAdapter(BasePlatformAdapter):
         self._mark_connected()
         _LIVE_ADAPTERS[self._token] = self
         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
+        if self._group_policy != "disabled":
+            logger.warning(
+                "[%s] WEIXIN_GROUP_POLICY=%s is set, but QR-login connects an iLink bot "
+                "identity (e.g. ...@im.bot) which typically cannot be invited into ordinary "
+                "WeChat groups. iLink usually does not deliver ordinary-group events for "
+                "these accounts, so group messages may never reach Hermes regardless of this "
+                "policy. If group delivery doesn't work, the limitation is on the iLink side, "
+                "not in Hermes.",
+                self.name,
+                self._group_policy,
+            )
         return True
 
     async def disconnect(self) -> None:
@@ -1275,7 +1298,8 @@ class WeixinAdapter(BasePlatformAdapter):
                 ret = response.get("ret", 0)
                 errcode = response.get("errcode", 0)
                 if ret not in (0, None) or errcode not in (0, None):
-                    if ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE:
+                    if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
+                            or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
                         logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
                         await asyncio.sleep(600)
                         consecutive_failures = 0
@@ -1550,20 +1574,24 @@ class WeixinAdapter(BasePlatformAdapter):
         retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
             try:
-                resp = await send_once(context_token)
-                error = _ilink_response_error(resp)
-                if error is not None:
-                    ret, errcode, errmsg = error
-                    is_session_expired = (
-                        ret == SESSION_EXPIRED_ERRCODE
-                        or errcode == SESSION_EXPIRED_ERRCODE
-                    )
-                    # Session expired — strip token and retry once
-                    if is_session_expired and not retried_without_token and context_token:
-                        retried_without_token = True
-                        context_token = None
-                        self._token_store._cache.pop(
-                            self._token_store._key(self._account_id, chat_id), None
+                resp = await _send_message(
+                    self._send_session,
+                    base_url=self._base_url,
+                    token=self._token,
+                    to=chat_id,
+                    text=chunk,
+                    context_token=context_token,
+                    client_id=client_id,
+                )
+                # Check iLink response for session-expired error
+                if resp and isinstance(resp, dict):
+                    ret = resp.get("ret")
+                    errcode = resp.get("errcode")
+                    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+                        is_session_expired = (
+                            ret == SESSION_EXPIRED_ERRCODE
+                            or errcode == SESSION_EXPIRED_ERRCODE
+                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
                         logger.warning(
                             "[%s] session expired for %s; retrying without context_token",
@@ -1631,7 +1659,7 @@ class WeixinAdapter(BasePlatformAdapter):
         _, image_cleaned = self.extract_images(cleaned_content)
         local_files, final_content = self.extract_local_files(image_cleaned)
 
-        _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+        _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
