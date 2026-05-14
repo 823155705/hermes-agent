@@ -626,7 +626,7 @@ def _assert_weixin_cdn_url(url: str) -> None:
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Unparseable media URL: {url!r}") from exc
 
-    if scheme not in ("http", "https"):
+    if scheme not in {"http", "https"}:
         raise ValueError(
             f"Media URL has disallowed scheme {scheme!r}; only http/https are permitted."
         )
@@ -1004,7 +1004,7 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
             ref = item.get("ref_msg") or {}
             ref_item = ref.get("message_item") or {}
             ref_type = ref_item.get("type")
-            if ref_type in (ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE):
+            if ref_type in {ITEM_IMAGE, ITEM_VIDEO, ITEM_FILE, ITEM_VOICE}:
                 title = ref.get("title") or ""
                 prefix = f"[引用媒体: {title}]\n" if title else "[引用媒体]\n"
                 return f"{prefix}{text}".strip()
@@ -1352,7 +1352,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
                 ret = response.get("ret", 0)
                 errcode = response.get("errcode", 0)
-                if ret not in (0, None) or errcode not in (0, None):
+                if ret not in {0, None} or errcode not in {0, None}:
                     if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
                             or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
                         logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
@@ -1642,7 +1642,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 if resp and isinstance(resp, dict):
                     ret = resp.get("ret")
                     errcode = resp.get("errcode")
-                    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+                    if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
